@@ -1,0 +1,318 @@
+name: Forex Edge AI 3.0 — Backtest ottobre 2026
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/verifica-forex.yml'
+permissions:
+  contents: read
+jobs:
+  backtest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: Setup runtime
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Write immutable backtest engine
+        shell: bash
+        run: |
+          mkdir -p scripts reports
+          cat > scripts/forex_month_v3.py <<'PYCODE_FOREX'
+          #!/usr/bin/env python3
+          """Forex Edge AI v3.0: pre-registered, conservative one-month research backtest. No trades are sent. Python 3.9+ standard library only. """
+          import argparse
+          import csv
+          import datetime as dt
+          import json
+          import math
+          import hashlib
+          from pathlib import Path
+          
+          UTC = dt.timezone.utc
+          PIP = 0.0001
+          START = dt.date(2026, 10, 1)
+          END = dt.date(2026, 11, 1)
+          INITIAL_CAPITAL = 10000.0
+          RISK = 0.0025
+          LEVERAGE_CAP = 2.0
+          LOTS_STEP = 1000
+          EFFICIENCY_MIN = 0.30
+          DISPLACEMENT_ATR_MIN = 0.60
+          SPREAD_CAP_PIPS = 2.0
+          SL_ATR = 1.20
+          TP_ATR = 1.80
+          COMMISSION_USD_PER_100K_PER_SIDE = 3.5
+          SLIPPAGE_PIPS_PER_SIDE = 0.20
+          
+          
+          def read_candles(path):
+              out = {}
+              with open(path, encoding='utf-8-sig', newline='') as f:
+                  reader = csv.DictReader(f)
+                  required = {'timestamp', 'open', 'high', 'low', 'close'}
+                  if not required.issubset(set(reader.fieldnames or [])):
+                      raise ValueError(f'{path}: colonne richieste {sorted(required)}')
+                  for line_no, row in enumerate(reader, 2):
+                      raw = row['timestamp'].strip()
+                      try:
+                          if raw.replace('.', '', 1).isdigit():
+                              unix = float(raw)
+                              stamp = dt.datetime.fromtimestamp(unix / (1000 if unix > 1e11 else 1), tz=UTC)
+                          else:
+                              stamp = dt.datetime.fromisoformat(raw.replace('Z', '+00:00'))
+                              if stamp.tzinfo is None:
+                                  raise ValueError('timestamp ISO senza timezone')
+                              stamp = stamp.astimezone(UTC)
+                          if stamp.minute != 0 or stamp.second != 0:
+                              raise ValueError('non è una candela H1')
+                          vals = {k: float(row[k]) for k in ('open', 'high', 'low', 'close')}
+                          if not all(math.isfinite(v) and v > 0 for v in vals.values()):
+                              raise ValueError('valore OHLC non valido')
+                          if vals['low'] > min(vals['open'], vals['close']) or vals['high'] < max(vals['open'], vals['close']):
+                              raise ValueError('OHLC incoerente')
+                          if stamp in out:
+                              raise ValueError('timestamp duplicato')
+                          out[stamp] = vals
+                      except Exception as ex:
+                          raise ValueError(f'{path}:{line_no}: {ex}') from ex
+              if not out:
+                  raise ValueError(f'{path}: nessun dato')
+              return out
+          
+          
+          def hourly(day, hour):
+              return dt.datetime(day.year, day.month, day.day, hour, tzinfo=UTC)
+          
+          
+          def atr20(bid, stamp):
+              """Mean true-range of exactly 20 completed bars, strictly before entry time."""
+              earlier = sorted(t for t in bid if t < stamp)
+              if len(earlier) < 21:
+                  return None
+              recent = earlier[-21:]
+              tr = []
+              for prev_t, t in zip(recent, recent[1:]):
+                  b, p = bid[t], bid[prev_t]
+                  tr.append(max(b['high']-b['low'], abs(b['high']-p['close']), abs(b['low']-p['close'])))
+              return sum(tr) / len(tr)
+          
+          
+          def compute_signal(day, bid, ask):
+              """08-11 UTC completed bars -> decision at 12:00 UTC, no future information."""
+              signal_ts = hourly(day, 12)
+              stamps = [hourly(day, h) for h in range(8, 17)]
+              if any(stamp not in bid or stamp not in ask for stamp in stamps):
+                  return None, 'missing_hours'
+              # Open bid/ask of each needed hour should not be inverted.
+              if any(ask[t]['open'] < bid[t]['open'] for t in stamps):
+                  return None, 'bad_bid_ask'
+              atr = atr20(bid, signal_ts)
+              if atr is None or atr <= 0:
+                  return None, 'insufficient_warmup'
+              window = [bid[hourly(day, h)] for h in range(8, 12)]
+              net = window[-1]['close'] - window[0]['open']
+              total_range = sum(b['high'] - b['low'] for b in window)
+              efficiency = abs(net) / total_range if total_range else 0.0
+              spread = (ask[signal_ts]['open'] - bid[signal_ts]['open']) / PIP
+              if spread < 0 or spread > SPREAD_CAP_PIPS:
+                  return None, 'high_spread'
+              if abs(net) < DISPLACEMENT_ATR_MIN * atr or efficiency < EFFICIENCY_MIN:
+                  return None, 'no_signal'
+              side = 'long' if net > 0 else 'short'
+              return {'side': side, 'atr': atr, 'efficiency': efficiency,
+                      'net_pips': net/PIP, 'entry_timestamp': signal_ts.isoformat(),
+                      'entry_spread_pips': spread}, 'signal'
+          
+          
+          def simulate_trade(day, signal, bid, ask, equity, slippage_pips, extra_cost_pips=0):
+              ts = hourly(day, 12)
+              side = signal['side']
+              atr = signal['atr']
+              entry = ask[ts]['open'] if side == 'long' else bid[ts]['open']
+              stop = entry - SL_ATR*atr if side == 'long' else entry + SL_ATR*atr
+              target = entry + TP_ATR*atr if side == 'long' else entry - TP_ATR*atr
+              slippage = slippage_pips * PIP
+              commission_per_unit = 2 * COMMISSION_USD_PER_100K_PER_SIDE / 100000
+              estimated_risk_per_unit = SL_ATR*atr + 2*slippage + commission_per_unit + extra_cost_pips*PIP
+              risk_units = math.floor((equity*RISK)/estimated_risk_per_unit / LOTS_STEP)*LOTS_STEP
+              leverage_units = math.floor((equity*LEVERAGE_CAP/entry) / LOTS_STEP)*LOTS_STEP
+              units = max(0, min(risk_units, leverage_units))
+              if not units:
+                  return None
+          
+              # H1 time resolution: if both barriers touch during an hour, STOP goes first.
+              exit_price = None
+              exit_reason = None
+              exit_at = None
+              for hour in range(12, 16):
+                  t = hourly(day, hour)
+                  candle = bid[t] if side == 'long' else ask[t]
+                  if side == 'long':
+                      if candle['open'] <= stop:
+                          exit_price, exit_reason = candle['open'], 'stop_gap'
+                      elif candle['low'] <= stop:
+                          exit_price, exit_reason = stop, 'stop'
+                      elif candle['open'] >= target or candle['high'] >= target:
+                          exit_price, exit_reason = target, 'target'
+                  else:
+                      if candle['open'] >= stop:
+                          exit_price, exit_reason = candle['open'], 'stop_gap'
+                      elif candle['high'] >= stop:
+                          exit_price, exit_reason = stop, 'stop'
+                      elif candle['open'] <= target or candle['low'] <= target:
+                          exit_price, exit_reason = target, 'target'
+                  if exit_reason:
+                      exit_at = t.isoformat()
+                      break
+              if exit_reason is None:
+                  end = hourly(day, 16)
+                  exit_price = bid[end]['open'] if side == 'long' else ask[end]['open']
+                  exit_at = end.isoformat()
+                  exit_reason = 'time_16utc'
+              gross = units * (exit_price-entry if side == 'long' else entry-exit_price)
+              cost = units * (2*slippage + commission_per_unit + extra_cost_pips*PIP)
+              pnl = gross - cost
+              return {'date': day.isoformat(), 'side': side, 'entry_time': ts.isoformat(),
+                      'exit_time': exit_at, 'entry': round(entry, 6), 'exit': round(exit_price, 6),
+                      'stop': round(stop, 6), 'target': round(target, 6), 'reason': exit_reason,
+                      'units_eur': units, 'gross_usd': round(gross, 3), 'cost_usd': round(cost, 3),
+                      'net_usd': round(pnl, 3), 'risk_usd_max_at_normal_stop': round(units*estimated_risk_per_unit, 3),
+                      'spread_at_entry_pips': round(signal['entry_spread_pips'], 3),
+                      'efficiency': round(signal['efficiency'], 4)}
+          
+          
+          def calculate_metrics(trades, initial=INITIAL_CAPITAL):
+              wins = [t for t in trades if t['net_usd'] > 0]
+              losses = [t for t in trades if t['net_usd'] < 0]
+              grosswin = sum(t['net_usd'] for t in wins)
+              grossloss = -sum(t['net_usd'] for t in losses)
+              pnl = sum(t['net_usd'] for t in trades)
+              equity, peak, dd = initial, initial, 0.0
+              for t in trades:
+                  equity += t['net_usd']
+                  peak = max(peak, equity)
+                  dd = max(dd, (peak-equity)/peak*100)
+              return {'trades': len(trades), 'wins': len(wins), 'losses': len(losses),
+                      'win_rate_pct': round(len(wins)/len(trades)*100, 2) if trades else 0,
+                      'net_usd': round(pnl, 2), 'return_pct': round(pnl/initial*100, 3),
+                      'end_equity_usd': round(initial+pnl, 2),
+                      'profit_factor': round(grosswin/grossloss, 3) if grossloss else None,
+                      'max_equity_drawdown_pct': round(dd, 3)}
+          
+          
+          def run(bid, ask, start=START, end=END, stress=False):
+              slippage = 0.50 if stress else SLIPPAGE_PIPS_PER_SIDE
+              extra = 1.0 if stress else 0.0
+              equity = INITIAL_CAPITAL
+              trades, skips = [], {}
+              missing_weekdays = []
+              date = start
+              while date < end:
+                  if date.weekday() >= 5:
+                      date += dt.timedelta(days=1)
+                      continue
+                  signal, reason = compute_signal(date, bid, ask)
+                  if reason == 'missing_hours':
+                      missing_weekdays.append(date.isoformat())
+                  if signal:
+                      trade = simulate_trade(date, signal, bid, ask, equity, slippage, extra)
+                      if trade:
+                          trades.append(trade)
+                          equity += trade['net_usd']
+                      else:
+                          skips['minimum_lot_or_risk'] = skips.get('minimum_lot_or_risk', 0)+1
+                  else:
+                      skips[reason] = skips.get(reason, 0)+1
+                  date += dt.timedelta(days=1)
+              return {'metrics': calculate_metrics(trades), 'trades': trades,
+                      'skips': skips, 'missing_weekdays': missing_weekdays,
+                      'data_complete': len(missing_weekdays)==0}
+          
+          
+          def make_report(bid, ask):
+              base = run(bid, ask)
+              stress = run(bid, ask, stress=True)
+              m, s = base['metrics'], stress['metrics']
+              verified_data = base['data_complete'] and stress['data_complete']
+              gate = verified_data and m['trades'] >= 8 and m['net_usd'] > 0 and (m['profit_factor'] or 0) >= 1.20 and m['max_equity_drawdown_pct'] <= 2.0 and s['net_usd'] >= 0
+              return {'strategy_name': 'Forex Edge AI 3.0 – Transizione 08–12 UTC',
+                      'status': 'ONE_MONTH_GATE_PASSED_NOT_REAL_VALIDATION' if gate else ('INCOMPLETE_DATA' if not verified_data else 'ONE_MONTH_GATE_NOT_PASSED'),
+                      'period_utc': '[2026-10-01, 2026-11-01)',
+                      'base': base, 'stress': stress,
+                      'checks': {'min_8_trades': m['trades'] >= 8,
+                                 'net_positive': m['net_usd'] > 0,
+                                 'profit_factor_at_least_1_20': (m['profit_factor'] or 0) >= 1.2,
+                                 'max_drawdown_at_most_2pct': m['max_equity_drawdown_pct'] <= 2,
+                                 'stress_net_nonnegative': s['net_usd'] >= 0,
+                                 'all_weekdays_present': verified_data},
+                      'assumptions': {'starting_usd': INITIAL_CAPITAL, 'max_risk_pct_trade': RISK*100,
+                                      'leverage_cap': LEVERAGE_CAP, 'base_slippage_pips_each_side': SLIPPAGE_PIPS_PER_SIDE,
+                                      'stress_slippage_pips_each_side': 0.5,
+                                      'stress_additional_roundtrip_pips': 1.0,
+                                      'commission_usd_per_100k_side': COMMISSION_USD_PER_100K_PER_SIDE,
+                                      'price_source': 'Dukascopy H1 bid and ask CSV, when provided',
+                                      'possible_execution_gap': 'H1 OHLC barriers cannot reproduce tick-by-tick fills',
+                                      'forward_realtime_validation': False}}
+          
+          
+          def main():
+              parser = argparse.ArgumentParser(description=__doc__)
+              parser.add_argument('--bid', required=True, help='Percorso CSV H1 bid (Sep-Oct 2026)')
+              parser.add_argument('--ask', required=True, help='Percorso CSV H1 ask (Sep-Oct 2026)')
+              parser.add_argument('--output', default='forex_month_v3_report.json')
+              args = parser.parse_args()
+              bid = read_candles(args.bid)
+              ask = read_candles(args.ask)
+              report = make_report(bid, ask)
+              report['input_files'] = {
+                  'bid': {'name': Path(args.bid).name, 'sha256': hashlib.sha256(Path(args.bid).read_bytes()).hexdigest(), 'bars': len(bid)},
+                  'ask': {'name': Path(args.ask).name, 'sha256': hashlib.sha256(Path(args.ask).read_bytes()).hexdigest(), 'bars': len(ask)}
+              }
+              Path(args.output).write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding='utf-8')
+              print('Stato:', report['status'])
+              print('Dati ottobre completi:', report['base']['data_complete'])
+              print('Mancanze:', report['base']['missing_weekdays'])
+              print('BASE:', report['base']['metrics'])
+              print('STRESS:', report['stress']['metrics'])
+              print('Report:', args.output)
+          
+          
+          if __name__ == '__main__':
+              main()
+          PYCODE_FOREX
+      - name: Check Python source
+        run: python -m py_compile scripts/forex_month_v3.py
+      - name: Download EUR/USD BID H1 Sep-Oct 2026
+        run: npx -y dukascopy-node -i eurusd -from 2026-09-01 -to 2026-11-01 -t h1 -p bid -f csv -fn eurusd_bid --cache --retries 3 --batch-pause 2000
+      - name: Download EUR/USD ASK H1 Sep-Oct 2026
+        run: npx -y dukascopy-node -i eurusd -from 2026-09-01 -to 2026-11-01 -t h1 -p ask -f csv -fn eurusd_ask --cache --retries 3 --batch-pause 2000
+      - name: Calculate and verify month results
+        run: python scripts/forex_month_v3.py --bid download/eurusd_bid.csv --ask download/eurusd_ask.csv --output reports/forex_october_2026_v3_report.json
+      - name: Write public summary
+        if: success()
+        run: |
+          python - <<'PYSUMMARY'
+          import json, os
+          r=json.load(open('reports/forex_october_2026_v3_report.json'))
+          b=r['base']['metrics']; s=r['stress']['metrics']
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
+              out.write('# EUR/USD - Ottobre 2026\n\n')
+              out.write(f"Esito: **{r['status']}**\n\n")
+              out.write(f"Trade: **{b['trades']}**, P&L netto: **${b['net_usd']:.2f}**, PF: **{b['profit_factor']}**, drawdown: **{b['max_equity_drawdown_pct']}%**\n\n")
+              out.write(f"Stress P&L: **${s['net_usd']:.2f}**\n\n")
+              out.write('Solo simulazione storica, non certificazione per trading reale.\n')
+          PYSUMMARY
+      - name: Save report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: forex-october-2026-test
+          path: reports/*.json
+          if-no-files-found: warn
